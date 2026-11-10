@@ -1,7 +1,7 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signInAnonymously, onAuthStateChanged, signOut, signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
 import { getFirestore, collection, doc, setDoc, getDoc, getDocFromServer, query, where, onSnapshot, addDoc, serverTimestamp, orderBy, limit, updateDoc, getDocs, deleteDoc } from 'firebase/firestore';
-import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { getStorage, ref, uploadBytes, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import firebaseConfigRaw from '../../firebase-applet-config.json';
 
 const metaEnv = typeof import.meta !== 'undefined' ? (import.meta as any).env || {} : {};
@@ -21,6 +21,8 @@ const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const storage = getStorage(app);
+storage.maxUploadRetryTime = 2000;
+storage.maxOperationRetryTime = 2000;
 export const googleProvider = new GoogleAuthProvider();
 
 export { 
@@ -47,5 +49,6 @@ export {
   deleteDoc,
   ref,
   uploadBytes,
+  uploadBytesResumable,
   getDownloadURL
 };

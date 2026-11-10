@@ -27,6 +27,7 @@ import {
   limit,
   ref,
   uploadBytes,
+  uploadBytesResumable,
   getDownloadURL
 } from './lib/firebase';
 import { 
@@ -56,6 +57,7 @@ import {
   Volume2,
   Maximize2,
   Scan,
+  Film,
   Check,
   Copy,
   Share2,
@@ -92,6 +94,24 @@ import {
   CodeData 
 } from './components/CodeSnippetViewer';
 import { 
+  MediaUploadItem, 
+  optimizeImageFile, 
+  generateVideoThumbnail, 
+  WhatsAppProgressRing, 
+  MessageUploadingMedia, 
+  ComposerUploadTray,
+  sliceFileIntoBase64Chunks,
+  assembleChunksToBlobUrl
+} from './components/MediaUploadUI';
+import { 
+  OfficeFileCard, 
+  OfficeSpreadsheetModal, 
+  OfficeTextViewerModal, 
+  OfficeDocumentModal, 
+  getOfficeFileInfo, 
+  OfficeIcon 
+} from './components/OfficeFileViewer';
+import { 
   getAvatarUrl, 
   ANIMAL_AVATARS, 
   getAnimalById, 
@@ -105,6 +125,8 @@ import { e2ee } from './lib/crypto';
 export { getAvatarUrl, ANIMAL_AVATARS, getAnimalById, generateShortUserId };
 
 export const AUTO_DELETE_OPTIONS = [
+  { id: '5m', label: '5 Minutes (Burner)', ms: 5 * 60 * 1000 },
+  { id: '15m', label: '15 Minutes', ms: 15 * 60 * 1000 },
   { id: '30m', label: '30 Minutes', ms: 30 * 60 * 1000 },
   { id: '1h', label: '1 Hour', ms: 60 * 60 * 1000 },
   { id: '2h', label: '2 Hours (Default)', ms: 2 * 60 * 60 * 1000 },
@@ -113,6 +135,60 @@ export const AUTO_DELETE_OPTIONS = [
   { id: '24h', label: '24 Hours', ms: 24 * 60 * 60 * 1000 },
   { id: 'never', label: 'Never (Turn Off Auto-Delete)', ms: null },
 ];
+
+export const DISAPPEARING_MESSAGE_OPTIONS = [
+  { id: '30s', label: '30 Seconds (Instant Burner)', ms: 30 * 1000 },
+  { id: '1m', label: '1 Minute (Ephemeral)', ms: 60 * 1000 },
+  { id: '5m', label: '5 Minutes', ms: 5 * 60 * 1000 },
+  { id: '15m', label: '15 Minutes', ms: 15 * 60 * 1000 },
+  { id: '30m', label: '30 Minutes', ms: 30 * 60 * 1000 },
+  { id: '1h', label: '1 Hour (Default)', ms: 60 * 60 * 1000 },
+  { id: '2h', label: '2 Hours', ms: 2 * 60 * 60 * 1000 },
+  { id: '24h', label: '24 Hours', ms: 24 * 60 * 60 * 1000 },
+  { id: 'off', label: 'Off (Keep until account wipe)', ms: null },
+];
+
+export const DEFAULT_DISAPPEARING_MS = 60 * 60 * 1000; // 1 hour
+
+export function getDisappearingDuration(chat?: { disappearingDuration?: number | null } | null, user?: { disappearingDuration?: number | null } | null): number | null {
+  if (chat && chat.disappearingDuration !== undefined) {
+    return chat.disappearingDuration;
+  }
+  if (user && user.disappearingDuration !== undefined) {
+    return user.disappearingDuration;
+  }
+  return DEFAULT_DISAPPEARING_MS;
+}
+
+export function wipeAllLocalCredentials() {
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i);
+      if (key && (key.startsWith('chatwave_') || key.startsWith('chat120_') || key.startsWith('e2ee_') || key.startsWith('firebase:'))) {
+        localStorage.removeItem(key);
+      }
+    }
+    localStorage.removeItem('chatwave_user_session');
+    localStorage.removeItem('chat120_user_session');
+    sessionStorage.clear();
+  } catch (err) {
+    console.warn('Error clearing local storage credentials:', err);
+  }
+}
+
+export async function purgeMessageWithChunks(chatId: string, messageId: string, isChunked?: boolean) {
+  try {
+    if (isChunked !== false) {
+      const chunksRef = collection(db, 'chats', chatId, 'messages', messageId, 'chunks');
+      const chunksSnap = await getDocs(chunksRef);
+      const deletePromises = chunksSnap.docs.map(d => deleteDoc(d.ref).catch(() => {}));
+      await Promise.all(deletePromises);
+    }
+    await deleteDoc(doc(db, 'chats', chatId, 'messages', messageId)).catch(() => {});
+  } catch (err) {
+    console.warn(`Failed to purge message ${messageId}:`, err);
+  }
+}
 
 // Client-side image optimization (resizes to maxDim and compresses to JPEG, typically 50-120KB)
 export function compressImage(file: File, maxDim = 1200, quality = 0.75): Promise<string> {
@@ -220,6 +296,7 @@ interface UserProfile {
   createdAtMs?: number;
   expiresAt?: number | null;
   autoDeleteDuration?: number | null;
+  disappearingDuration?: number | null;
   guestCreatedAt?: number;
   blockedUsers?: string[];
 }
@@ -240,6 +317,7 @@ interface Chat {
   requestSenderId?: string;
   requestReceiverId?: string;
   acceptedAt?: any;
+  disappearingDuration?: number | null;
 }
 
 interface Message {
@@ -266,6 +344,11 @@ interface Message {
   isPinned?: boolean;
   deletedForEveryone?: boolean;
   deletedFor?: string[];
+  isChunked?: boolean;
+  totalChunks?: number;
+  thumbnailUrl?: string;
+  textContent?: string;
+  officeCategory?: string;
   createdAt: any;
 }
 
@@ -538,11 +621,13 @@ const NameEntryScreen: React.FC<{ onJoin: (user: UserProfile) => void }> = ({ on
               {autoDeleteOption === 'never' ? 'Manual Delete Only' : autoDeleteOption === '2h' ? '120 Mins (Default)' : 'Auto-Destruct'}
             </span>
           </div>
-          <div className="grid grid-cols-4 gap-1.5">
+          <div className="grid grid-cols-3 sm:grid-cols-6 gap-1.5">
             {[
-              { id: '2h', label: '120 Mins' },
-              { id: '1h', label: '60 Mins' },
+              { id: '5m', label: '5 Mins' },
+              { id: '15m', label: '15 Mins' },
               { id: '30m', label: '30 Mins' },
+              { id: '1h', label: '60 Mins' },
+              { id: '2h', label: '120 Mins' },
               { id: 'never', label: 'Permanent' }
             ].map((opt) => (
               <button
@@ -1085,6 +1170,12 @@ const MessageBubble: React.FC<{
   isSelectMode?: boolean;
   isSelected?: boolean;
   onToggleSelect?: (msgId: string) => void;
+  uploadItem?: MediaUploadItem;
+  onCancelUpload?: (uploadId: string) => void;
+  onRetryUpload?: (uploadId: string) => void;
+  onOpenSpreadsheet?: (fileName: string, csvText: string, downloadUrl?: string) => void;
+  onOpenTextDoc?: (fileName: string, textContent: string, downloadUrl?: string) => void;
+  onOpenDocDetails?: (fileName: string, fileSize?: number, downloadUrl?: string) => void;
 }> = ({ 
   message, 
   isOwn, 
@@ -1096,12 +1187,117 @@ const MessageBubble: React.FC<{
   currentUserId,
   isSelectMode,
   isSelected,
-  onToggleSelect
+  onToggleSelect,
+  uploadItem,
+  onCancelUpload,
+  onRetryUpload,
+  onOpenSpreadsheet,
+  onOpenTextDoc,
+  onOpenDocDetails
 }) => {
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [showBubbleMenu, setShowBubbleMenu] = useState(false);
   const [showFilePreview, setShowFilePreview] = useState(false);
+  const [chunkedMediaUrl, setChunkedMediaUrl] = useState<string | null>(null);
+  const [isLoadingChunked, setIsLoadingChunked] = useState(false);
   const reactionEmojis = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+
+  const handleLoadChunkedMedia = async () => {
+    if (chunkedMediaUrl || isLoadingChunked || !message.isChunked || !message.chatId) return;
+    setIsLoadingChunked(true);
+    try {
+      const chunksSnap = await getDocs(query(
+        collection(db, 'chats', message.chatId, 'messages', message.id, 'chunks'),
+        orderBy('index', 'asc')
+      ));
+      const chunkDataList = chunksSnap.docs.map(d => d.data().data as string);
+      const mime = message.type === 'video' ? 'video/mp4' : 'application/octet-stream';
+      const assembledUrl = assembleChunksToBlobUrl(chunkDataList, mime);
+      setChunkedMediaUrl(assembledUrl);
+    } catch (e) {
+      console.error('Failed to load chunked media:', e);
+    } finally {
+      setIsLoadingChunked(false);
+    }
+  };
+
+  const handlePreviewSpreadsheet = async () => {
+    if (message.textContent) {
+      onOpenSpreadsheet?.(message.fileName || 'Spreadsheet.csv', message.textContent, chunkedMediaUrl || message.fileUrl);
+      return;
+    }
+    const targetUrl = chunkedMediaUrl || message.fileUrl;
+    if (targetUrl) {
+      try {
+        const res = await fetch(targetUrl);
+        const text = await res.text();
+        onOpenSpreadsheet?.(message.fileName || 'Spreadsheet.csv', text, targetUrl);
+        return;
+      } catch (err) {
+        console.warn('Failed to fetch file text', err);
+      }
+    }
+    if (message.isChunked && !chunkedMediaUrl) {
+      setIsLoadingChunked(true);
+      try {
+        const chunksSnap = await getDocs(query(
+          collection(db, 'chats', message.chatId, 'messages', message.id, 'chunks'),
+          orderBy('index', 'asc')
+        ));
+        const chunkDataList = chunksSnap.docs.map(d => d.data().data as string);
+        const assembledUrl = assembleChunksToBlobUrl(chunkDataList, 'text/csv');
+        setChunkedMediaUrl(assembledUrl);
+        const res = await fetch(assembledUrl);
+        const text = await res.text();
+        onOpenSpreadsheet?.(message.fileName || 'Spreadsheet.csv', text, assembledUrl);
+      } catch {
+        onOpenDocDetails?.(message.fileName || 'Spreadsheet', message.fileSize, chunkedMediaUrl || message.fileUrl);
+      } finally {
+        setIsLoadingChunked(false);
+      }
+    } else {
+      onOpenDocDetails?.(message.fileName || 'Spreadsheet', message.fileSize, chunkedMediaUrl || message.fileUrl);
+    }
+  };
+
+  const handlePreviewTextDoc = async () => {
+    if (message.textContent) {
+      onOpenTextDoc?.(message.fileName || 'Document.txt', message.textContent, chunkedMediaUrl || message.fileUrl);
+      return;
+    }
+    const targetUrl = chunkedMediaUrl || message.fileUrl;
+    if (targetUrl) {
+      try {
+        const res = await fetch(targetUrl);
+        const text = await res.text();
+        onOpenTextDoc?.(message.fileName || 'Document.txt', text, targetUrl);
+        return;
+      } catch (err) {
+        console.warn('Failed to fetch file text', err);
+      }
+    }
+    if (message.isChunked && !chunkedMediaUrl) {
+      setIsLoadingChunked(true);
+      try {
+        const chunksSnap = await getDocs(query(
+          collection(db, 'chats', message.chatId, 'messages', message.id, 'chunks'),
+          orderBy('index', 'asc')
+        ));
+        const chunkDataList = chunksSnap.docs.map(d => d.data().data as string);
+        const assembledUrl = assembleChunksToBlobUrl(chunkDataList, 'text/plain');
+        setChunkedMediaUrl(assembledUrl);
+        const res = await fetch(assembledUrl);
+        const text = await res.text();
+        onOpenTextDoc?.(message.fileName || 'Document.txt', text, assembledUrl);
+      } catch {
+        onOpenDocDetails?.(message.fileName || 'Document', message.fileSize, chunkedMediaUrl || message.fileUrl);
+      } finally {
+        setIsLoadingChunked(false);
+      }
+    } else {
+      onOpenDocDetails?.(message.fileName || 'Document', message.fileSize, chunkedMediaUrl || message.fileUrl);
+    }
+  };
 
   // Check if standard text contains markdown code block (```lang ... ```)
   const isMarkdownCode = useMemo(() => {
@@ -1210,8 +1406,17 @@ const MessageBubble: React.FC<{
           </div>
         )}
 
-        {/* Image Attachment */}
-        {message.type === 'image' && message.imageUrl && (
+        {/* Uploading Media State with WhatsApp Circular Progress Ring & Cancel X */}
+        {uploadItem && (
+          <MessageUploadingMedia 
+            item={uploadItem}
+            onCancel={onCancelUpload || (() => {})}
+            onRetry={onRetryUpload || (() => {})}
+          />
+        )}
+
+        {/* Image Attachment (Completed) */}
+        {message.type === 'image' && message.imageUrl && !uploadItem && (
           <div 
             onClick={() => onImageClick?.(message.imageUrl!)}
             className="relative group mb-2 cursor-pointer rounded-xl overflow-hidden"
@@ -1228,42 +1433,60 @@ const MessageBubble: React.FC<{
           </div>
         )}
 
-        {/* Video Attachment */}
-        {message.type === 'video' && message.videoUrl && (
+        {/* Video Attachment (Completed) */}
+        {message.type === 'video' && !uploadItem && (
           <div className="relative group rounded-xl overflow-hidden mb-2 bg-black/40">
-            <video src={message.videoUrl} className="max-w-full max-h-80 rounded-xl" controls />
+            {message.isChunked && !chunkedMediaUrl ? (
+              <div 
+                className="relative cursor-pointer max-h-80 w-full flex items-center justify-center bg-black/60 rounded-xl overflow-hidden min-h-[160px]"
+                onClick={handleLoadChunkedMedia}
+              >
+                {message.thumbnailUrl ? (
+                  <img src={message.thumbnailUrl} className="rounded-xl max-w-full max-h-80 object-cover" alt="Video thumbnail" />
+                ) : (
+                  <div className="w-64 h-36 flex items-center justify-center text-[#8696a0]">
+                    <Film className="w-12 h-12 text-[#00a884]/80" />
+                  </div>
+                )}
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40 hover:bg-black/50 transition">
+                  {isLoadingChunked ? (
+                    <div className="w-10 h-10 border-2 border-[#00a884] border-t-transparent rounded-full animate-spin mb-1"></div>
+                  ) : (
+                    <div className="w-12 h-12 rounded-full bg-[#00a884] flex items-center justify-center text-white shadow-xl hover:scale-105 transition mb-1">
+                      <Play className="w-6 h-6 fill-current translate-x-0.5" />
+                    </div>
+                  )}
+                  <span className="text-[11px] text-white font-medium bg-black/50 px-2.5 py-0.5 rounded-full backdrop-blur-sm">
+                    {isLoadingChunked ? 'Loading video...' : `Play Video • ${message.fileSize ? (message.fileSize / (1024 * 1024)).toFixed(1) + ' MB' : ''}`}
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <video 
+                src={chunkedMediaUrl || message.videoUrl || ''} 
+                className="max-w-full max-h-80 rounded-xl" 
+                controls 
+                autoPlay={!!chunkedMediaUrl} 
+              />
+            )}
           </div>
         )}
 
-        {/* File Attachment Card (with direct preview toggle if code/text) */}
-        {message.type === 'file' && message.fileUrl && !message.code && (
-          <div className="p-3 bg-black/25 rounded-xl mb-2 border border-white/10">
-            <div className="flex items-center gap-3">
-              <div className="p-2.5 bg-[#00a884]/20 rounded-lg text-[#00a884]">
-                <FileText className="w-6 h-6" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-[#e9edef] truncate">{message.fileName || 'Attachment'}</p>
-                {message.fileSize && (
-                  <p className="text-[11px] text-[#8696a0]">
-                    {(message.fileSize / 1024).toFixed(1)} KB
-                  </p>
-                )}
-              </div>
-              <div className="flex items-center gap-1.5">
-                <a 
-                  href={message.fileUrl} 
-                  download={message.fileName || 'file'} 
-                  target="_blank" 
-                  rel="noopener noreferrer" 
-                  className="p-2 bg-[#2a3942] hover:bg-[#3b4a54] text-[#e9edef] rounded-lg transition"
-                  title="Download file"
-                >
-                  <Download className="w-4 h-4" />
-                </a>
-              </div>
-            </div>
-          </div>
+        {/* Office Document & File Attachment Card */}
+        {message.type === 'file' && !message.code && !uploadItem && (
+          <OfficeFileCard
+            fileName={message.fileName || 'Document'}
+            fileSize={message.fileSize}
+            downloadUrl={chunkedMediaUrl || message.fileUrl}
+            isChunked={message.isChunked}
+            isLoadingChunked={isLoadingChunked}
+            onDownloadChunked={handleLoadChunkedMedia}
+            onPreviewSpreadsheet={handlePreviewSpreadsheet}
+            onPreviewText={handlePreviewTextDoc}
+            onOpenDetails={() => {
+              onOpenDocDetails?.(message.fileName || 'Document', message.fileSize, chunkedMediaUrl || message.fileUrl);
+            }}
+          />
         )}
 
         {/* Standard Text (if not a standalone code block or voice note) */}
@@ -1429,7 +1652,8 @@ const ProfileModal = ({
   onDeleteSession,
   onClearData,
   onDeleteAccount,
-  onUpdateExpiry
+  onUpdateExpiry,
+  onUpdateDisappearingDuration
 }: { 
   user: UserProfile, 
   onClose: () => void, 
@@ -1441,7 +1665,8 @@ const ProfileModal = ({
   onDeleteSession?: () => void,
   onClearData?: () => Promise<void> | void,
   onDeleteAccount?: () => Promise<void> | void,
-  onUpdateExpiry?: (durationMs: number | null) => Promise<void> | void
+  onUpdateExpiry?: (durationMs: number | null) => Promise<void> | void,
+  onUpdateDisappearingDuration?: (durationMs: number | null) => Promise<void> | void
 }) => {
   const [activeTab, setActiveTab] = useState<'profile' | 'timer' | 'share' | 'data'>('profile');
   const [name, setName] = useState(user.displayName);
@@ -1773,38 +1998,92 @@ const ProfileModal = ({
               {/* Adjust Timer Buttons */}
               {onUpdateExpiry && (
                 <div className="pt-2 border-t border-[#3b4a54]/50">
-                  <span className="text-[10px] text-[#8696a0] block mb-1.5">Change timer or turn off:</span>
-                  <div className="grid grid-cols-4 gap-1.5 text-center">
-                    <button
-                      type="button"
-                      onClick={() => onUpdateExpiry(30 * 60 * 1000)}
-                      className="py-1.5 px-1 bg-[#202c33] hover:bg-[#2a3942] text-[#e9edef] text-xs font-medium rounded-lg border border-[#3b4a54] transition"
-                    >
-                      30m
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onUpdateExpiry(60 * 60 * 1000)}
-                      className="py-1.5 px-1 bg-[#202c33] hover:bg-[#2a3942] text-[#e9edef] text-xs font-medium rounded-lg border border-[#3b4a54] transition"
-                    >
-                      1h
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onUpdateExpiry(2 * 60 * 60 * 1000)}
-                      className="py-1.5 px-1 bg-[#202c33] hover:bg-[#2a3942] text-[#00a884] text-xs font-semibold rounded-lg border border-[#00a884]/40 transition"
-                    >
-                      2h (Reset)
-                    </button>
+                  <span className="text-[10px] text-[#8696a0] block mb-1.5 font-medium">Select account lifetime before auto-deletion:</span>
+                  <div className="grid grid-cols-3 sm:grid-cols-5 gap-1.5 text-center">
+                    {[
+                      { ms: 5 * 60 * 1000, label: '5m' },
+                      { ms: 15 * 60 * 1000, label: '15m' },
+                      { ms: 30 * 60 * 1000, label: '30m' },
+                      { ms: 60 * 60 * 1000, label: '1h' },
+                      { ms: 2 * 60 * 60 * 1000, label: '2h (Default)' },
+                      { ms: 6 * 60 * 60 * 1000, label: '6h' },
+                      { ms: 12 * 60 * 60 * 1000, label: '12h' },
+                      { ms: 24 * 60 * 60 * 1000, label: '24h' },
+                    ].map((opt) => (
+                      <button
+                        key={opt.label}
+                        type="button"
+                        onClick={() => onUpdateExpiry(opt.ms)}
+                        className={cn(
+                          "py-1.5 px-1 bg-[#202c33] hover:bg-[#2a3942] text-xs font-medium rounded-lg border transition",
+                          user.autoDeleteDuration === opt.ms ? "border-[#00a884] text-[#00a884] font-bold bg-[#00a884]/15" : "border-[#3b4a54] text-[#e9edef]"
+                        )}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
                     <button
                       type="button"
                       onClick={() => onUpdateExpiry(null)}
-                      className="py-1.5 px-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-semibold rounded-lg border border-amber-500/30 transition"
-                      title="Turn off automatic account deletion"
+                      className={cn(
+                        "py-1.5 px-1 text-xs font-semibold rounded-lg border transition",
+                        user.autoDeleteDuration === null ? "bg-amber-500/25 border-amber-500 text-amber-300 font-bold" : "bg-amber-500/15 hover:bg-amber-500/25 border-amber-500/30 text-amber-300"
+                      )}
+                      title="Keep account permanently until manual deletion"
                     >
                       Turn OFF
                     </button>
                   </div>
+                </div>
+              )}
+            </div>
+
+            {/* Disappearing Messages (Self-Destructing Messages) Card */}
+            <div className="bg-[#111b21] p-3.5 rounded-2xl border border-sky-500/30 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-sky-400" />
+                  <div>
+                    <p className="text-xs font-semibold text-[#e9edef]">Disappearing Messages</p>
+                    <p className="text-[10px] text-[#8696a0]">
+                      Messages and media self-destruct after timer
+                    </p>
+                  </div>
+                </div>
+                <span className="text-xs font-mono font-bold px-2.5 py-1 rounded-lg text-sky-400 bg-sky-500/15">
+                  {user.disappearingDuration !== undefined
+                    ? (DISAPPEARING_MESSAGE_OPTIONS.find(o => o.ms === user.disappearingDuration)?.label || 'Custom')
+                    : '1 Hour (Default)'}
+                </span>
+              </div>
+
+              {onUpdateDisappearingDuration && (
+                <div className="pt-2 border-t border-[#3b4a54]/50">
+                  <span className="text-[10px] text-[#8696a0] block mb-1.5 font-medium">Global default timer for all chats:</span>
+                  <div className="grid grid-cols-3 gap-1.5 text-center">
+                    {DISAPPEARING_MESSAGE_OPTIONS.map((opt) => {
+                      const isActive = (user.disappearingDuration ?? DEFAULT_DISAPPEARING_MS) === opt.ms;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => onUpdateDisappearingDuration(opt.ms)}
+                          className={cn(
+                            "py-1.5 px-1 text-xs font-medium rounded-lg border transition truncate",
+                            isActive 
+                              ? "bg-sky-500/20 border-sky-400 text-sky-300 font-bold" 
+                              : "bg-[#202c33] hover:bg-[#2a3942] border-[#3b4a54] text-[#e9edef]"
+                          )}
+                          title={opt.label}
+                        >
+                          {opt.label.replace(' (Instant Burner)', '').replace(' (Ephemeral)', '').replace(' (Default)', '').replace(' (Keep until account wipe)', '')}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="text-[9px] text-[#8696a0] mt-1.5">
+                    Note: You can also customize the timer per-chat directly from the chat header menu.
+                  </p>
                 </div>
               )}
             </div>
@@ -2686,7 +2965,9 @@ export default function App() {
   const [showChatMenu, setShowChatMenu] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const [isUploading, setIsUploading] = useState(false);
+  const [activeUploads, setActiveUploads] = useState<MediaUploadItem[]>([]);
+  const uploadTasksRef = useRef<Record<string, any>>({});
+  const isUploading = useMemo(() => activeUploads.some(u => u.status === 'uploading'), [activeUploads]);
   const [toast, setToast] = useState<string | null>(null);
   const [chatFilter, setChatFilter] = useState<'all' | 'direct' | 'group' | 'requests'>('all');
   const [showEmojiTray, setShowEmojiTray] = useState(false);
@@ -2698,12 +2979,25 @@ export default function App() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [detectedLargeCode, setDetectedLargeCode] = useState<string | null>(null);
 
+  // Office Document Viewers (Excel, PowerPoint, Word, PDF, Text)
+  const [officeSpreadsheetData, setOfficeSpreadsheetData] = useState<{ fileName: string; csvText: string; downloadUrl?: string } | null>(null);
+  const [officeTextData, setOfficeTextData] = useState<{ fileName: string; textContent: string; downloadUrl?: string } | null>(null);
+  const [officeDocDetails, setOfficeDocDetails] = useState<{ fileName: string; fileSize?: number; downloadUrl?: string } | null>(null);
+
   // WhatsApp-style message deletion & selection mode states
   const [deleteConfirmMessage, setDeleteConfirmMessage] = useState<Message | null>(null);
   const [showClearChatModal, setShowClearChatModal] = useState(false);
+  const [showDisappearingModal, setShowDisappearingModal] = useState(false);
+  const [timeTick, setTimeTick] = useState(Date.now());
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [selectedMessageIds, setSelectedMessageIds] = useState<string[]>([]);
   const [showBatchDeleteModal, setShowBatchDeleteModal] = useState(false);
+
+  // 1-second interval to update timeTick so expiring messages vanish immediately
+  useEffect(() => {
+    const timer = setInterval(() => setTimeTick(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   // User Profile Viewing & Blocking state
   const [contactProfileModalUser, setContactProfileModalUser] = useState<{ uid: string; displayName: string; photoURL?: string } | null>(null);
@@ -2972,7 +3266,10 @@ export default function App() {
   }, [chats, user]);
 
   // Auto-delete / Disappearing Messages after 1 hour (WhatsApp-style)
-  const ONE_HOUR_MS = 60 * 60 * 1000;
+  // Disappearing Messages duration calculation (respects per-chat setting, falls back to user default, or 1h default)
+  const activeChatDisappearingMs = useMemo(() => {
+    return getDisappearingDuration(activeChat, user);
+  }, [activeChat, user]);
 
   const visibleMessages = useMemo(() => {
     if (!user) return [];
@@ -2993,40 +3290,164 @@ export default function App() {
         }
       }
 
-      const msgTime = m.createdAt?.toMillis ? m.createdAt.toMillis() : (m.createdAt ? new Date(m.createdAt).getTime() : now);
+      const msgTime = m.createdAt?.toMillis 
+        ? m.createdAt.toMillis() 
+        : (m.createdAt?.toDate ? m.createdAt.toDate().getTime() : (m.createdAt ? new Date(m.createdAt).getTime() : now));
+      
       // Hidden if before user's clear timestamp
       if (userClearTime && msgTime <= userClearTime) return false;
 
-      // Automatically hide and delete after 1 hour
-      if (m.createdAt && (now - msgTime > ONE_HOUR_MS)) {
+      // Automatically hide and delete after the user-selected duration (if enabled)
+      if (activeChatDisappearingMs !== null && m.createdAt && (now - msgTime > activeChatDisappearingMs)) {
         return false;
       }
       return true;
     });
-  }, [messages, user, activeChat]);
+  }, [messages, user, activeChat, activeChatDisappearingMs, timeTick]);
 
-  // Background 1-hour old message permanent cleanup for the active chat
+  // Dual-speed message and chunk permanent sweeper across active chat and all user chats
   useEffect(() => {
-    if (!activeChat) return;
-    const cleanupOldMessages = async () => {
+    if (!user) return;
+
+    // Fast sweeper (every 4s) for the active chat so short burners (30s/1m) disappear and purge immediately
+    const sweepActiveChat = async () => {
+      if (!activeChat) return;
+      const duration = getDisappearingDuration(activeChat, user);
+      if (duration === null) return; // Off
+
       const now = Date.now();
       const expiredMsgs = messages.filter(m => {
         if (!m.createdAt) return false;
-        const msgTime = m.createdAt?.toMillis ? m.createdAt.toMillis() : new Date(m.createdAt).getTime();
-        return (now - msgTime > ONE_HOUR_MS);
+        const msgTime = m.createdAt?.toMillis ? m.createdAt.toMillis() : (m.createdAt?.toDate ? m.createdAt.toDate().getTime() : new Date(m.createdAt).getTime());
+        return (now - msgTime > duration);
       });
 
       for (const expMsg of expiredMsgs) {
-        try {
-          await deleteDoc(doc(db, 'chats', activeChat.id, 'messages', expMsg.id));
-        } catch {}
+        await purgeMessageWithChunks(activeChat.id, expMsg.id, (expMsg as any).isChunked);
       }
     };
 
-    cleanupOldMessages();
-    const interval = setInterval(cleanupOldMessages, 60000);
-    return () => clearInterval(interval);
-  }, [activeChat, messages]);
+    sweepActiveChat();
+    const fastInterval = setInterval(sweepActiveChat, 4000);
+
+    // Global background sweeper (every 20s) across all chats so expired messages in inactive chats are also purged with chunks
+    const sweepAllChats = async () => {
+      if (!chats || chats.length === 0) return;
+      const now = Date.now();
+      for (const chat of chats) {
+        const duration = getDisappearingDuration(chat, user);
+        if (duration === null) continue; // Off
+
+        try {
+          const msgsSnap = await getDocs(collection(db, 'chats', chat.id, 'messages'));
+          for (const mDoc of msgsSnap.docs) {
+            const mData = mDoc.data();
+            if (!mData.createdAt) continue;
+            const msgTime = mData.createdAt?.toMillis 
+              ? mData.createdAt.toMillis() 
+              : (mData.createdAt?.toDate ? mData.createdAt.toDate().getTime() : new Date(mData.createdAt).getTime());
+            if (now - msgTime > duration) {
+              await purgeMessageWithChunks(chat.id, mDoc.id, mData.isChunked);
+            }
+          }
+        } catch {
+          // ignore background sweep errors
+        }
+      }
+    };
+
+    const slowInterval = setInterval(sweepAllChats, 20000);
+
+    return () => {
+      clearInterval(fastInterval);
+      clearInterval(slowInterval);
+    };
+  }, [activeChat, messages, chats, user]);
+
+  // Comprehensive User Data & Session Purge: leaves zero residual data on Firestore or client
+  const purgeAllUserData = async (targetUser: UserProfile) => {
+    const targetUid = targetUser.uid;
+    try {
+      // 1. Delete user document from 'users'
+      await deleteDoc(doc(db, 'users', targetUid)).catch(() => {});
+
+      // 2. Scan and purge all chats the user participated in
+      for (const chat of chats) {
+        try {
+          if (chat.type === 'dm') {
+            // In 1-on-1 DM: purge all messages and chunks, then delete the DM chat document completely
+            const msgsSnap = await getDocs(collection(db, 'chats', chat.id, 'messages'));
+            for (const mDoc of msgsSnap.docs) {
+              await purgeMessageWithChunks(chat.id, mDoc.id, mDoc.data()?.isChunked);
+            }
+            await deleteDoc(doc(db, 'chats', chat.id)).catch(() => {});
+          } else if (chat.type === 'group') {
+            // Group chat: delete all messages sent by this user and all chunks
+            const userMsgsSnap = await getDocs(
+              query(collection(db, 'chats', chat.id, 'messages'), where('senderId', '==', targetUid))
+            );
+            for (const mDoc of userMsgsSnap.docs) {
+              await purgeMessageWithChunks(chat.id, mDoc.id, mDoc.data()?.isChunked);
+            }
+            // Remove user from group participants
+            const remainingParticipants = (chat.participants || []).filter((p: string) => p !== targetUid);
+            if (remainingParticipants.length === 0) {
+              const allMsgsSnap = await getDocs(collection(db, 'chats', chat.id, 'messages'));
+              for (const mDoc of allMsgsSnap.docs) {
+                await purgeMessageWithChunks(chat.id, mDoc.id, mDoc.data()?.isChunked);
+              }
+              await deleteDoc(doc(db, 'chats', chat.id)).catch(() => {});
+            } else {
+              await updateDoc(doc(db, 'chats', chat.id), {
+                participants: remainingParticipants,
+              }).catch(() => {});
+            }
+          }
+        } catch (chatErr) {
+          console.warn('Error purging chat during account delete:', chatErr);
+        }
+      }
+
+      // 3. Purge WebRTC call records involving user
+      try {
+        const callsQuery1 = query(collection(db, 'calls'), where('callerId', '==', targetUid));
+        const callsSnap1 = await getDocs(callsQuery1);
+        for (const cDoc of callsSnap1.docs) {
+          await deleteDoc(cDoc.ref).catch(() => {});
+        }
+        const callsQuery2 = query(collection(db, 'calls'), where('receiverId', '==', targetUid));
+        const callsSnap2 = await getDocs(callsQuery2);
+        for (const cDoc of callsSnap2.docs) {
+          await deleteDoc(cDoc.ref).catch(() => {});
+        }
+      } catch (callErr) {
+        console.warn('Error purging calls:', callErr);
+      }
+
+      // 4. Delete Auth user or Sign Out
+      try {
+        if (auth.currentUser && auth.currentUser.uid === targetUid) {
+          await auth.currentUser.delete().catch(() => signOut(auth));
+        } else {
+          await signOut(auth);
+        }
+      } catch {}
+
+      // 5. Wipe all local credentials, tokens, session keys
+      wipeAllLocalCredentials();
+
+      // 6. Reset in-memory states
+      setUser(null);
+      setActiveChat(null);
+      setChats([]);
+      setMessages([]);
+      setActiveUploads([]);
+      setShowProfileModal(false);
+      setShowDeleteAccountConfirm(false);
+    } catch (err) {
+      console.error('Fatal error during purgeAllUserData:', err);
+    }
+  };
 
   // Universal ID Auto-Deletion & Countdown (Supports customizable duration or Off)
   useEffect(() => {
@@ -3048,22 +3469,15 @@ export default function App() {
       setSessionRemainingSeconds(remaining);
 
       if (remaining <= 0) {
-        try {
-          await deleteDoc(doc(db, 'users', user.uid));
-        } catch (e) {
-          console.warn('Failed to delete expired user doc:', e);
-        }
-        localStorage.removeItem('chatwave_user_session');
-        setUser(null);
-        setActiveChat(null);
-        showNotification('Your temporary ID has expired and was automatically deleted.');
+        await purgeAllUserData(user);
+        showNotification('Your temporary session has expired. All data was permanently deleted.');
       }
     };
 
     checkExpiry();
     const timer = setInterval(checkExpiry, 1000);
     return () => clearInterval(timer);
-  }, [user]);
+  }, [user, chats]);
 
   // Adjust account auto-delete lifetime or turn it off
   const handleUpdateExpiry = async (newDurationMs: number | null) => {
@@ -3082,6 +3496,7 @@ export default function App() {
       };
       setUser(updatedUser);
       localStorage.setItem('chatwave_user_session', JSON.stringify(updatedUser));
+      localStorage.setItem('chat120_user_session', JSON.stringify(updatedUser));
       if (newDurationMs === null) {
         setSessionRemainingSeconds(null);
         showNotification('Auto-delete turned OFF. Account will be kept.');
@@ -3093,6 +3508,46 @@ export default function App() {
     } catch (e) {
       console.error('Failed to update account expiry:', e);
       showNotification('Failed to update account expiry.');
+    }
+  };
+
+  // Update global default disappearing messages duration in user profile
+  const handleUpdateGlobalDisappearingTimer = async (durationMs: number | null) => {
+    if (!user) return;
+    try {
+      await updateDoc(doc(db, 'users', user.uid), {
+        disappearingDuration: durationMs
+      });
+      const updatedUser: UserProfile = {
+        ...user,
+        disappearingDuration: durationMs
+      };
+      setUser(updatedUser);
+      localStorage.setItem('chatwave_user_session', JSON.stringify(updatedUser));
+      localStorage.setItem('chat120_user_session', JSON.stringify(updatedUser));
+      const label = DISAPPEARING_MESSAGE_OPTIONS.find(o => o.ms === durationMs)?.label || 'Updated';
+      showNotification(`Default disappearing messages set to: ${label}`);
+    } catch (err) {
+      console.error('Failed to update global disappearing timer', err);
+      showNotification('Failed to update default timer.');
+    }
+  };
+
+  // Update per-chat disappearing messages duration
+  const handleUpdateChatDisappearingTimer = async (durationMs: number | null) => {
+    if (!activeChat || !user) return;
+    try {
+      await updateDoc(doc(db, 'chats', activeChat.id), {
+        disappearingDuration: durationMs
+      });
+      setActiveChat(prev => prev ? { ...prev, disappearingDuration: durationMs } : null);
+      setChats(prev => prev.map(c => c.id === activeChat.id ? { ...c, disappearingDuration: durationMs } : c));
+      const label = DISAPPEARING_MESSAGE_OPTIONS.find(o => o.ms === durationMs)?.label || 'Updated';
+      showNotification(`Disappearing messages set to: ${label}`);
+      setShowDisappearingModal(false);
+    } catch (err) {
+      console.error('Failed to update chat disappearing timer', err);
+      showNotification('Failed to update timer.');
     }
   };
 
@@ -3119,35 +3574,11 @@ export default function App() {
     }
   };
 
-  // Delete account and permanently wipe user doc, auth, and local session
+  // Delete account and permanently wipe user doc, auth, and all data
   const handleDeleteAccount = async () => {
     if (!user) return;
-    try {
-      await deleteDoc(doc(db, 'users', user.uid));
-    } catch (e) {
-      console.warn('Failed to delete user doc in firestore:', e);
-    }
-    try {
-      if (auth.currentUser) {
-        await auth.currentUser.delete().catch(() => signOut(auth));
-      } else {
-        await signOut(auth);
-      }
-    } catch {}
-    localStorage.removeItem('chatwave_user_session');
-    for (let i = localStorage.length - 1; i >= 0; i--) {
-      const key = localStorage.key(i);
-      if (key && key.startsWith('chatwave_')) {
-        localStorage.removeItem(key);
-      }
-    }
-    setUser(null);
-    setActiveChat(null);
-    setChats([]);
-    setMessages([]);
-    setShowProfileModal(false);
-    setShowDeleteAccountConfirm(false);
-    showNotification('Account and ID permanently deleted.');
+    await purgeAllUserData(user);
+    showNotification('Account and all associated data permanently deleted.');
   };
 
   // Delete session manually on exit
@@ -3609,7 +4040,6 @@ export default function App() {
       }
     }
     try {
-      setIsUploading(true);
       const reader = new FileReader();
       reader.onloadend = async () => {
         try {
@@ -3635,14 +4065,11 @@ export default function App() {
         } catch (err) {
           console.error('Failed to send voice note', err);
           showNotification('Failed to send voice note.');
-        } finally {
-          setIsUploading(false);
         }
       };
       reader.readAsDataURL(audioBlob);
     } catch (err) {
       console.error('Failed to process voice note', err);
-      setIsUploading(false);
       showNotification('Failed to record voice note.');
     }
   };
@@ -3663,6 +4090,12 @@ export default function App() {
         code: null,
         codeTitle: null,
       });
+      if ((msg as any).isChunked) {
+        const chunksSnap = await getDocs(collection(db, 'chats', activeChat.id, 'messages', msg.id, 'chunks'));
+        for (const cDoc of chunksSnap.docs) {
+          await deleteDoc(cDoc.ref).catch(() => {});
+        }
+      }
       showNotification('Message deleted for everyone');
     } catch (err) {
       console.error('Failed to delete for everyone', err);
@@ -3706,6 +4139,12 @@ export default function App() {
           code: null,
           codeTitle: null,
         });
+        if ((m as any).isChunked) {
+          const chunksSnap = await getDocs(collection(db, 'chats', activeChat.id, 'messages', m.id, 'chunks'));
+          for (const cDoc of chunksSnap.docs) {
+            await deleteDoc(cDoc.ref).catch(() => {});
+          }
+        }
       }
       setSelectedMessageIds([]);
       setIsSelectMode(false);
@@ -3792,7 +4231,7 @@ export default function App() {
       const q = query(collection(db, 'chats', activeChat.id, 'messages'));
       const snap = await getDocs(q);
       for (const mDoc of snap.docs) {
-        await deleteDoc(mDoc.ref);
+        await purgeMessageWithChunks(activeChat.id, mDoc.id, mDoc.data()?.isChunked);
       }
       await updateDoc(doc(db, 'chats', activeChat.id), {
         lastMessage: 'Messages cleared',
@@ -3907,7 +4346,7 @@ export default function App() {
         });
 
         await updateDoc(doc(db, 'chats', activeChat.id), {
-          lastMessage: msgText,
+          lastMessage: '🔒 Message',
           lastMessageAt: serverTimestamp(),
         });
       }
@@ -4010,12 +4449,291 @@ export default function App() {
     }
   };
 
-  const processFileAndSend = async (file: File) => {
-    if (!file || !activeChat || !user) return;
+  const executeUpload = async (item: MediaUploadItem) => {
+    if (!user || !item) return;
+
+    let isAborted = false;
+    let abortMsgDocId: string | null = null;
+    uploadTasksRef.current[item.id] = {
+      cancel: () => {
+        isAborted = true;
+        if (abortMsgDocId) {
+          deleteDoc(doc(db, 'chats', item.chatId, 'messages', abortMsgDocId)).catch(() => {});
+        }
+      }
+    };
+
+    try {
+      // 1. IMAGES (Instant client-side canvas compression -> smooth WhatsApp circular progress -> direct Firestore save in ~0.35s!)
+      if (item.fileType === 'image') {
+        const opt = await optimizeImageFile(item.file, 1200, 0.78);
+        if (isAborted) return;
+
+        // Smooth WhatsApp circular progress ring
+        setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, previewUrl: opt.dataUrl, progress: 28, status: 'uploading' } : u));
+        await new Promise(r => setTimeout(r, 90));
+        if (isAborted) return;
+
+        setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, progress: 68 } : u));
+        await new Promise(r => setTimeout(r, 110));
+        if (isAborted) return;
+
+        setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, progress: 100 } : u));
+        await new Promise(r => setTimeout(r, 60));
+        if (isAborted) return;
+
+        await finalizeUploadSuccess(item, opt.dataUrl);
+        return;
+      }
+
+      // 2. VIDEOS
+      if (item.fileType === 'video') {
+        const vidThumb = await generateVideoThumbnail(item.file);
+        if (isAborted) return;
+        if (vidThumb) {
+          setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, previewUrl: vidThumb } : u));
+        }
+
+        // Small video under 750KB
+        if (item.fileSize <= 750 * 1024) {
+          const dataUrl = await readFileAsDataURL(item.file);
+          if (isAborted) return;
+
+          setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, progress: 35 } : u));
+          await new Promise(r => setTimeout(r, 100));
+          if (isAborted) return;
+
+          setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, progress: 75 } : u));
+          await new Promise(r => setTimeout(r, 120));
+          if (isAborted) return;
+
+          setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, progress: 100 } : u));
+          await new Promise(r => setTimeout(r, 60));
+          if (isAborted) return;
+
+          await finalizeUploadSuccess(item, dataUrl);
+          return;
+        }
+
+        // Larger video (> 750KB): chunked Firestore upload with real chunk progress
+        const chunks = await sliceFileIntoBase64Chunks(item.file);
+        const totalChunks = chunks.length;
+
+        const defaultText = '🎥 Video';
+        const msgRef = await addDoc(collection(db, 'chats', item.chatId, 'messages'), {
+          chatId: item.chatId,
+          senderId: user.uid,
+          senderName: user.displayName,
+          text: defaultText,
+          type: 'video',
+          videoUrl: vidThumb || '',
+          thumbnailUrl: vidThumb || '',
+          isChunked: true,
+          totalChunks,
+          fileName: item.fileName,
+          fileSize: item.fileSize,
+          createdAt: serverTimestamp(),
+        });
+        abortMsgDocId = msgRef.id;
+
+        for (let i = 0; i < totalChunks; i++) {
+          if (isAborted) {
+            deleteDoc(msgRef).catch(() => {});
+            return;
+          }
+
+          await setDoc(doc(db, 'chats', item.chatId, 'messages', msgRef.id, 'chunks', String(i)), {
+            index: i,
+            data: chunks[i]
+          });
+
+          const progress = Math.round(((i + 1) / totalChunks) * 100);
+          setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, progress } : u));
+        }
+
+        await updateDoc(doc(db, 'chats', item.chatId), {
+          lastMessage: defaultText,
+          lastMessageAt: serverTimestamp(),
+        });
+
+        if (item.previewUrl?.startsWith('blob:')) {
+          try { URL.revokeObjectURL(item.previewUrl); } catch {}
+        }
+        delete uploadTasksRef.current[item.id];
+        setActiveUploads(prev => prev.filter(u => u.id !== item.id));
+        showNotification('Video sent!');
+        return;
+      }
+
+      // 3. DOCUMENTS & FILES
+      if (item.fileSize <= 750 * 1024) {
+        const dataUrl = await readFileAsDataURL(item.file);
+        if (isAborted) return;
+
+        setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, progress: 40 } : u));
+        await new Promise(r => setTimeout(r, 90));
+        if (isAborted) return;
+
+        setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, progress: 80 } : u));
+        await new Promise(r => setTimeout(r, 110));
+        if (isAborted) return;
+
+        setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, progress: 100 } : u));
+        await new Promise(r => setTimeout(r, 60));
+        if (isAborted) return;
+
+        await finalizeUploadSuccess(item, dataUrl);
+        return;
+      } else {
+        const officeInfo = getOfficeFileInfo(item.fileName);
+        let textContent: string | undefined;
+        if (item.file && item.fileSize <= 350 * 1024 && (officeInfo.isSpreadsheet || officeInfo.isTextDoc)) {
+          try {
+            textContent = await item.file.text();
+          } catch {}
+        }
+
+        const chunks = await sliceFileIntoBase64Chunks(item.file);
+        const totalChunks = chunks.length;
+        const defaultText = `📄 ${item.fileName}`;
+
+        const msgRef = await addDoc(collection(db, 'chats', item.chatId, 'messages'), {
+          chatId: item.chatId,
+          senderId: user.uid,
+          senderName: user.displayName,
+          text: defaultText,
+          type: 'file',
+          fileUrl: '',
+          isChunked: true,
+          totalChunks,
+          fileName: item.fileName,
+          fileSize: item.fileSize,
+          officeCategory: officeInfo.category,
+          textContent: textContent || null,
+          createdAt: serverTimestamp(),
+        });
+        abortMsgDocId = msgRef.id;
+
+        for (let i = 0; i < totalChunks; i++) {
+          if (isAborted) {
+            deleteDoc(msgRef).catch(() => {});
+            return;
+          }
+
+          await setDoc(doc(db, 'chats', item.chatId, 'messages', msgRef.id, 'chunks', String(i)), {
+            index: i,
+            data: chunks[i]
+          });
+
+          const progress = Math.round(((i + 1) / totalChunks) * 100);
+          setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, progress } : u));
+        }
+
+        await updateDoc(doc(db, 'chats', item.chatId), {
+          lastMessage: defaultText,
+          lastMessageAt: serverTimestamp(),
+        });
+
+        if (item.previewUrl?.startsWith('blob:')) {
+          try { URL.revokeObjectURL(item.previewUrl); } catch {}
+        }
+        delete uploadTasksRef.current[item.id];
+        setActiveUploads(prev => prev.filter(u => u.id !== item.id));
+        showNotification('File sent!');
+        return;
+      }
+    } catch (err: any) {
+      console.error('Upload error:', err);
+      delete uploadTasksRef.current[item.id];
+      setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, status: 'failed', error: err?.message || 'Failed to start upload' } : u));
+    }
+  };
+
+  const finalizeUploadSuccess = async (item: MediaUploadItem, finalUrl: string) => {
+    if (!user) return;
+    delete uploadTasksRef.current[item.id];
+
+    const officeInfo = getOfficeFileInfo(item.fileName);
+    let textContent: string | undefined;
+    if (item.file && item.fileSize <= 350 * 1024 && (officeInfo.isSpreadsheet || officeInfo.isTextDoc)) {
+      try {
+        textContent = await item.file.text();
+      } catch {}
+    }
+
+    const defaultText = item.fileType === 'image' ? '📷 Photo' : item.fileType === 'video' ? '🎥 Video' : `📄 ${item.fileName}`;
+
+    try {
+      await addDoc(collection(db, 'chats', item.chatId, 'messages'), {
+        chatId: item.chatId,
+        senderId: user.uid,
+        senderName: user.displayName,
+        text: defaultText,
+        imageUrl: item.fileType === 'image' ? finalUrl : null,
+        videoUrl: item.fileType === 'video' ? finalUrl : null,
+        fileUrl: item.fileType === 'file' ? finalUrl : null,
+        fileName: item.fileName,
+        fileSize: item.fileSize,
+        type: item.fileType,
+        officeCategory: item.fileType === 'file' ? officeInfo.category : undefined,
+        textContent: textContent || null,
+        createdAt: serverTimestamp(),
+      });
+
+      await updateDoc(doc(db, 'chats', item.chatId), {
+        lastMessage: defaultText,
+        lastMessageAt: serverTimestamp(),
+      });
+
+      // Cleanup object URL
+      if (item.previewUrl?.startsWith('blob:')) {
+        try { URL.revokeObjectURL(item.previewUrl); } catch {}
+      }
+
+      // Remove from active uploads
+      setActiveUploads(prev => prev.filter(u => u.id !== item.id));
+    } catch (dbErr) {
+      console.error('Failed to save message to Firestore:', dbErr);
+      setActiveUploads(prev => prev.map(u => u.id === item.id ? { ...u, status: 'failed', error: 'Database save failed. Tap to retry.' } : u));
+    }
+  };
+
+  const handleCancelUpload = (uploadId: string) => {
+    const task = uploadTasksRef.current[uploadId];
+    if (task && typeof task.cancel === 'function') {
+      try {
+        task.cancel();
+      } catch (e) {
+        console.warn('Cancel task note:', e);
+      }
+      delete uploadTasksRef.current[uploadId];
+    }
+
+    const item = activeUploads.find(u => u.id === uploadId);
+    if (item?.previewUrl?.startsWith('blob:')) {
+      try { URL.revokeObjectURL(item.previewUrl); } catch {}
+    }
+
+    setActiveUploads(prev => prev.filter(u => u.id !== uploadId));
+    showNotification('Upload cancelled');
+  };
+
+  const handleRetryUpload = (uploadId: string) => {
+    const item = activeUploads.find(u => u.id === uploadId);
+    if (!item) return;
+
+    setActiveUploads(prev => prev.map(u => u.id === uploadId ? { ...u, status: 'uploading', progress: 0, error: undefined } : u));
+    executeUpload({ ...item, status: 'uploading', progress: 0, error: undefined });
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>, mediaKind: 'media' | 'doc' | 'camera' = 'media') => {
+    const fileList = e.target.files;
+    if (!fileList || fileList.length === 0 || !activeChat || !user) return;
 
     // Request guard
     if (activeChat.type === 'dm' && activeChat.requestStatus === 'pending') {
       showNotification(activeChat.requestSenderId === user.uid ? "Waiting for user to accept your chat request." : "Please accept the chat request to send files.");
+      if (e.target) e.target.value = '';
       return;
     }
 
@@ -4025,19 +4743,28 @@ export default function App() {
       const isBlockedByMe = otherUid ? (user.blockedUsers?.includes(otherUid) || false) : false;
       if (isBlockedByMe) {
         showNotification("You have blocked this contact. Unblock to send files.");
+        if (e.target) e.target.value = '';
         return;
       }
     }
 
     setShowAttachMenu(false);
-    setIsUploading(true);
-    try {
+    const files = Array.from(fileList);
+    if (e.target) e.target.value = '';
+
+    for (const file of files) {
+      if (file.size > 100 * 1024 * 1024) {
+        showNotification(`"${file.name}" exceeds 100MB limit. Maximum allowed is 100MB.`);
+        continue;
+      }
+
       const isImg = file.type.startsWith('image/');
       const isVid = file.type.startsWith('video/');
-      const isCodeOrText = file.name.match(/\.(txt|md|log|json|csv|env|py|js|ts|tsx|jsx|html|htm|css|sql|sh|yaml|yml|java|c|cpp|h|hpp|rs|go|xml|php|rb|swift|kt|dart|ini|conf|bash|zsh)$/i) || file.type.startsWith('text/');
-      
-      // Automatically preview all code and text files inline so download is not needed!
-      if (isCodeOrText && file.size < 10 * 1024 * 1024) {
+      const isOfficeOrDoc = file.name.match(/\.(xlsx|xls|csv|tsv|ods|pptx|ppt|pps|key|odp|docx|doc|rtf|odt|pdf|txt|md|log|json)$/i);
+      const isPureCode = !isOfficeOrDoc && file.name.match(/\.(py|js|ts|tsx|jsx|html|htm|css|sql|sh|yaml|yml|java|c|cpp|h|hpp|rs|go|php|rb|swift|kt|dart)$/i);
+
+      // Only automatically send as standalone code snippets if pure code source file
+      if (isPureCode && file.size < 2 * 1024 * 1024) {
         try {
           const codeText = await file.text();
           const ext = file.name.split('.').pop()?.toLowerCase() || 'txt';
@@ -4046,89 +4773,93 @@ export default function App() {
             language: ext,
             title: file.name
           });
-          setIsUploading(false);
-          return;
-        } catch (codeReadErr) {
-          console.warn('Fallback to standard file for code upload', codeReadErr);
+          continue;
+        } catch (codeErr) {
+          console.warn('Fallback to standard file upload for code file', codeErr);
         }
       }
 
       const msgType: 'image' | 'video' | 'file' = isImg ? 'image' : isVid ? 'video' : 'file';
-
-      let mediaUrl = '';
-      if (isImg) {
-        try {
-          // Fast high-quality compressed image (<50ms, ~50KB)
-          mediaUrl = await compressImage(file, 960, 0.72);
-        } catch {
-          mediaUrl = await readFileAsDataURL(file);
-        }
-      } else {
-        if (file.size > 100 * 1024 * 1024) {
-          showNotification('File exceeds 100MB limit. Please choose a file up to 100MB.');
-          setIsUploading(false);
-          return;
-        }
-        if (file.size <= 700 * 1024) {
-          mediaUrl = await readFileAsDataURL(file);
-        }
-      }
-
-      // Upload to Cloud Storage for all files (especially large files up to 100MB)
-      try {
-        showNotification(`Uploading ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)...`);
-        const safeName = `${Date.now()}_${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-        const fileRef = ref(storage, `chats/${activeChat.id}/${safeName}`);
-        await uploadBytes(fileRef, file);
-        const storageUrl = await getDownloadURL(fileRef);
-        if (storageUrl) mediaUrl = storageUrl;
-      } catch (storageErr) {
-        console.warn('Storage upload note:', storageErr);
-        if (!mediaUrl) {
-          if (file.size <= 700 * 1024) {
-            mediaUrl = await readFileAsDataURL(file);
-          } else {
-            showNotification('Upload failed. Cloud storage required for files over 1MB.');
-            setIsUploading(false);
-            return;
-          }
-        }
-      }
-
-      const defaultText = msgType === 'image' ? '📷 Photo' : msgType === 'video' ? '🎥 Video' : `📄 ${file.name}`;
       
-      await addDoc(collection(db, 'chats', activeChat.id, 'messages'), {
-        chatId: activeChat.id,
-        senderId: user.uid,
-        senderName: user.displayName,
-        text: defaultText,
-        imageUrl: msgType === 'image' ? mediaUrl : null,
-        videoUrl: msgType === 'video' ? mediaUrl : null,
-        fileUrl: msgType === 'file' ? mediaUrl : null,
-        fileName: file.name,
-        fileSize: file.size,
-        type: msgType,
-        createdAt: serverTimestamp(),
-      });
+      // Instant local preview thumbnail (<1ms via object URL)
+      let previewUrl = '';
+      try {
+        previewUrl = URL.createObjectURL(file);
+      } catch {
+        previewUrl = '';
+      }
 
-      await updateDoc(doc(db, 'chats', activeChat.id), {
-        lastMessage: defaultText,
-        lastMessageAt: serverTimestamp(),
-      });
-      showNotification('Media sent successfully!');
-    } catch (error) {
-      console.error('Upload failed', error);
-      showNotification('Upload failed. Please try again.');
-    } finally {
-      setIsUploading(false);
+      const uploadId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      const newItem: MediaUploadItem = {
+        id: uploadId,
+        file,
+        chatId: activeChat.id,
+        fileName: file.name,
+        name: file.name,
+        fileSize: file.size,
+        size: file.size,
+        fileType: msgType,
+        type: msgType,
+        previewUrl,
+        progress: 0,
+        status: 'uploading',
+        createdAt: Date.now(),
+      };
+
+      // Add to active uploads state immediately for instant feedback
+      setActiveUploads(prev => [...prev, newItem]);
+
+      // Execute upload asynchronously in background
+      executeUpload(newItem);
     }
   };
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>, mediaKind: 'media' | 'doc' | 'camera' = 'media') => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    await processFileAndSend(file);
-    if (e.target) e.target.value = '';
+  const handleInputPaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+    if (!activeChat || !user) return;
+    const items = e.clipboardData?.items;
+    if (!items || items.length === 0) return;
+
+    const filesToUpload: File[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type.startsWith('image/')) {
+        const file = item.getAsFile();
+        if (file) filesToUpload.push(file);
+      }
+    }
+
+    if (filesToUpload.length > 0) {
+      e.preventDefault();
+      for (const file of filesToUpload) {
+        let previewUrl = '';
+        try {
+          previewUrl = URL.createObjectURL(file);
+        } catch {
+          previewUrl = '';
+        }
+
+        const uploadId = `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+        const pastedName = file.name || `Pasted_Image_${Date.now()}.png`;
+        const newItem: MediaUploadItem = {
+          id: uploadId,
+          file,
+          chatId: activeChat.id,
+          fileName: pastedName,
+          name: pastedName,
+          fileSize: file.size,
+          size: file.size,
+          fileType: 'image',
+          type: 'image',
+          previewUrl,
+          progress: 0,
+          status: 'uploading',
+          createdAt: Date.now(),
+        };
+
+        setActiveUploads(prev => [...prev, newItem]);
+        executeUpload(newItem);
+      }
+    }
   };
 
   const handleCreateGroup = async () => {
@@ -5215,20 +5946,35 @@ export default function App() {
                         {isRequestReceiver && <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-1.5 py-0.2 rounded font-medium shrink-0">Incoming Request</span>}
                         {isRequestSender && <span className="text-[10px] bg-amber-500/20 text-amber-400 px-1.5 py-0.2 rounded font-medium shrink-0">Request Pending</span>}
                       </div>
-                      <p className="text-[#8696a0] text-[11px] sm:text-xs truncate flex items-center gap-1">
-                        <span className="text-[#00a884] text-[10px]">🔒</span>
-                        <span>
-                          {activeChat.type === 'group' 
-                            ? `${activeChat.participants.length} members • E2EE` 
-                            : isBlockedByMe 
-                            ? 'Blocked contact • Tap to unblock' 
-                            : isRequestReceiver 
-                            ? 'Pending request • Tap to accept' 
-                            : isRequestSender 
-                            ? 'Request sent • Waiting for approval' 
-                            : 'online • encrypted'}
-                        </span>
-                      </p>
+                      <div className="flex items-center gap-1.5 min-w-0 flex-wrap">
+                        <p className="text-[#8696a0] text-[11px] sm:text-xs truncate flex items-center gap-1">
+                          <span className="text-[#00a884] text-[10px]">🔒</span>
+                          <span>
+                            {activeChat.type === 'group' 
+                              ? `${activeChat.participants.length} members • E2EE` 
+                              : isBlockedByMe 
+                              ? 'Blocked contact • Tap to unblock' 
+                              : isRequestReceiver 
+                              ? 'Pending request • Tap to accept' 
+                              : isRequestSender 
+                              ? 'Request sent • Waiting for approval' 
+                              : 'online • encrypted'}
+                          </span>
+                        </p>
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); setShowDisappearingModal(true); }}
+                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] bg-[#00a884]/15 hover:bg-[#00a884]/25 text-[#00a884] border border-[#00a884]/30 transition shrink-0"
+                          title="Change disappearing messages timer"
+                        >
+                          <Clock className="w-2.5 h-2.5" />
+                          <span>
+                            {activeChatDisappearingMs !== null
+                              ? (DISAPPEARING_MESSAGE_OPTIONS.find(o => o.ms === activeChatDisappearingMs)?.label.replace(' (Instant Burner)', '').replace(' (Ephemeral)', '').replace(' (Default)', '') || 'Custom')
+                              : 'Off'}
+                          </span>
+                        </button>
+                      </div>
                     </div>
                   </div>
                   <div className="flex items-center gap-1 sm:gap-2 text-[#8696a0] shrink-0">
@@ -5263,7 +6009,7 @@ export default function App() {
                       </button>
 
                       {showChatMenu && (
-                        <div className="absolute right-0 top-10 w-52 bg-[#202c33] rounded-xl shadow-2xl border border-[#3b4a54] py-1.5 z-50 text-sm">
+                        <div className="absolute right-0 top-10 w-56 bg-[#202c33] rounded-xl shadow-2xl border border-[#3b4a54] py-1.5 z-50 text-sm">
                           <button 
                             onClick={() => { 
                               if (activeChat.type === 'dm' && otherUid) {
@@ -5281,6 +6027,22 @@ export default function App() {
                           >
                             <Info className="w-4 h-4 text-[#00a884]" />
                             <span>{activeChat.type === 'group' ? 'Group info' : 'Contact profile'}</span>
+                          </button>
+
+                          {/* Disappearing messages timer action */}
+                          <button 
+                            onClick={() => { setShowDisappearingModal(true); setShowChatMenu(false); }}
+                            className="w-full px-4 py-2.5 text-left text-[#e9edef] hover:bg-[#111b21] flex items-center gap-2.5 transition"
+                          >
+                            <Clock className="w-4 h-4 text-[#00a884]" />
+                            <div className="flex-1 min-w-0">
+                              <span className="block text-xs font-medium">Disappearing messages</span>
+                              <span className="text-[10px] text-[#8696a0] block truncate">
+                                {activeChatDisappearingMs !== null 
+                                  ? (DISAPPEARING_MESSAGE_OPTIONS.find(o => o.ms === activeChatDisappearingMs)?.label || 'Active')
+                                  : 'Off'}
+                              </span>
+                            </div>
                           </button>
 
                           <button 
@@ -5344,13 +6106,53 @@ export default function App() {
               );
             })()}
 
-            {/* Messages Area - WhatsApp style fluid scrolling */}
+            {/* Messages Area - WhatsApp style fluid scrolling with Office Drag & Drop */}
             <div 
               ref={chatContainerRef}
               onScroll={handleChatScroll}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setIsDragOver(true);
+              }}
+              onDragLeave={(e) => {
+                e.preventDefault();
+                setIsDragOver(false);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                setIsDragOver(false);
+                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                  const syntheticEvent = {
+                    target: { files: e.dataTransfer.files, value: '' }
+                  } as unknown as React.ChangeEvent<HTMLInputElement>;
+                  handleFileUpload(syntheticEvent, 'doc');
+                }
+              }}
               className="flex-1 w-full min-w-0 min-h-0 max-w-full overflow-y-auto overflow-x-hidden p-2.5 sm:p-4 chat-wallpaper custom-scrollbar overscroll-contain relative"
               style={{ WebkitOverflowScrolling: 'touch' }}
             >
+              {/* Drag and drop overlay for Office documents and media */}
+              {isDragOver && (
+                <div className="absolute inset-0 z-40 bg-[#0b141a]/90 backdrop-blur-sm border-2 border-dashed border-[#00a884] rounded-2xl flex flex-col items-center justify-center p-6 pointer-events-none m-2">
+                  <div className="flex items-center gap-3 mb-3">
+                    <div className="w-10 h-10 rounded-xl bg-[#107c41]/20 flex items-center justify-center text-[#107c41]">
+                      <OfficeIcon category="excel" className="w-6 h-6" />
+                    </div>
+                    <div className="w-10 h-10 rounded-xl bg-[#c43e1c]/20 flex items-center justify-center text-[#c43e1c]">
+                      <OfficeIcon category="powerpoint" className="w-6 h-6" />
+                    </div>
+                    <div className="w-10 h-10 rounded-xl bg-[#185abd]/20 flex items-center justify-center text-[#185abd]">
+                      <OfficeIcon category="word" className="w-6 h-6" />
+                    </div>
+                    <div className="w-10 h-10 rounded-xl bg-[#e5252a]/20 flex items-center justify-center text-[#e5252a]">
+                      <OfficeIcon category="pdf" className="w-6 h-6" />
+                    </div>
+                  </div>
+                  <p className="text-base font-semibold text-[#e9edef] mb-1">Drop Office Documents & Files Here</p>
+                  <p className="text-xs text-[#8696a0]">Excel, PowerPoint, Word, PDFs, CSV, text, and media supported</p>
+                </div>
+              )}
+
               <div className="flex flex-col min-h-full w-full min-w-0 max-w-full">
                 {/* 1-Hour Disappearing Message Notice */}
                 <div className="flex justify-center mb-3">
@@ -5472,6 +6274,9 @@ export default function App() {
                         isOwn={msg.senderId === user.uid} 
                         onImageClick={(url) => setLightboxImage(url)}
                         onOpenFullscreenCode={(codeData) => setFullscreenCodeData(codeData)}
+                        onOpenSpreadsheet={(fileName, csvText, downloadUrl) => setOfficeSpreadsheetData({ fileName, csvText, downloadUrl })}
+                        onOpenTextDoc={(fileName, textContent, downloadUrl) => setOfficeTextData({ fileName, textContent, downloadUrl })}
+                        onOpenDocDetails={(fileName, fileSize, downloadUrl) => setOfficeDocDetails({ fileName, fileSize, downloadUrl })}
                         onReact={(msgId, emoji) => handleToggleReaction(msgId, emoji)}
                         onTogglePin={(msgId, currentPin) => handleTogglePin(msgId, currentPin)}
                         onDeleteMessage={(msg) => setDeleteConfirmMessage(msg)}
@@ -5487,6 +6292,20 @@ export default function App() {
                     </React.Fragment>
                   );
                 })}
+
+                {/* Active Media Uploads in current chat stream (WhatsApp-style instant optimistic preview with circular progress & cancel) */}
+                {activeUploads.filter(u => u.chatId === activeChat.id).map(uploadItem => (
+                  <div key={uploadItem.id} className="flex mb-3.5 justify-end">
+                    <div className="w-fit max-w-[94%] sm:max-w-[85%] md:max-w-[75%] min-w-0 overflow-hidden break-words p-2 sm:p-2.5 rounded-2xl shadow-md relative bg-[#005c4b] text-[#e9edef] rounded-tr-none">
+                      <MessageUploadingMedia 
+                        item={uploadItem}
+                        onCancel={handleCancelUpload}
+                        onRetry={handleRetryUpload}
+                      />
+                    </div>
+                  </div>
+                ))}
+
                 <div ref={messagesEndRef} />
               </div>
 
@@ -5602,6 +6421,13 @@ export default function App() {
 
               return (
                 <div className="bg-[#202c33] p-2.5 sm:p-3 flex flex-col gap-2 relative border-t border-[#2e3b43]/50 shrink-0 sticky bottom-0 z-30 pb-[max(0.625rem,env(safe-area-inset-bottom))]">
+                  {/* WhatsApp-Style Upload Preview & Progress Tray */}
+                  <ComposerUploadTray 
+                    uploads={activeUploads.filter(u => u.chatId === activeChat.id)}
+                    onCancel={handleCancelUpload}
+                    onRetry={handleRetryUpload}
+                  />
+
                   {/* Quick Emoji Tray */}
                   <AnimatePresence>
                     {showEmojiTray && (
@@ -5658,7 +6484,6 @@ export default function App() {
                           showAttachMenu ? "bg-[#3b4a54] text-[#00a884]" : "text-[#8696a0] hover:text-[#e9edef]"
                         )}
                         title="Attach media or document"
-                        disabled={isUploading}
                       >
                         <Paperclip className="w-5 h-5" />
                       </motion.button>
@@ -5670,48 +6495,100 @@ export default function App() {
                             animate={{ opacity: 1, y: 0, scale: 1 }}
                             exit={{ opacity: 0, y: 15, scale: 0.95 }}
                             transition={{ duration: 0.15 }}
-                            className="absolute bottom-14 left-0 bg-[#202c33] rounded-2xl shadow-2xl border border-[#3b4a54] p-2 flex flex-col gap-1 z-50 w-56 text-sm backdrop-blur-md"
+                            className="absolute bottom-14 left-0 bg-[#202c33] rounded-2xl shadow-2xl border border-[#3b4a54] p-2 flex flex-col gap-1 z-50 w-64 text-sm backdrop-blur-md"
                           >
-                            <label className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition">
-                              <div className="w-8 h-8 rounded-full bg-purple-500/20 text-purple-400 flex items-center justify-center">
+                            <label className="flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition group">
+                              <div className="w-8 h-8 rounded-lg bg-[#107c41]/20 text-[#107c41] flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
+                                <OfficeIcon category="excel" className="w-4 h-4" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <span className="font-medium text-[13px] block">Excel & Spreadsheets</span>
+                                <span className="text-[10px] text-[#8696a0] block truncate">.xlsx, .xls, .csv, .tsv, .ods</span>
+                              </div>
+                              <input 
+                                type="file" 
+                                className="hidden" 
+                                accept=".xlsx,.xls,.csv,.tsv,.ods,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv" 
+                                multiple
+                                onChange={(e) => handleFileUpload(e, 'doc')}
+                              />
+                            </label>
+
+                            <label className="flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition group">
+                              <div className="w-8 h-8 rounded-lg bg-[#c43e1c]/20 text-[#c43e1c] flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
+                                <OfficeIcon category="powerpoint" className="w-4 h-4" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <span className="font-medium text-[13px] block">PowerPoint & Slides</span>
+                                <span className="text-[10px] text-[#8696a0] block truncate">.pptx, .ppt, .pps, .key, .odp</span>
+                              </div>
+                              <input 
+                                type="file" 
+                                className="hidden" 
+                                accept=".pptx,.ppt,.pps,.key,.odp,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.ms-powerpoint" 
+                                multiple
+                                onChange={(e) => handleFileUpload(e, 'doc')}
+                              />
+                            </label>
+
+                            <label className="flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition group">
+                              <div className="w-8 h-8 rounded-lg bg-[#185abd]/20 text-[#185abd] flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
+                                <OfficeIcon category="word" className="w-4 h-4" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <span className="font-medium text-[13px] block">Word & PDF Docs</span>
+                                <span className="text-[10px] text-[#8696a0] block truncate">.docx, .doc, .pdf, .rtf, .txt</span>
+                              </div>
+                              <input 
+                                type="file" 
+                                className="hidden" 
+                                accept=".docx,.doc,.rtf,.odt,.pdf,.txt,.md,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/pdf,text/plain" 
+                                multiple
+                                onChange={(e) => handleFileUpload(e, 'doc')}
+                              />
+                            </label>
+
+                            <div className="h-px bg-white/10 my-0.5" />
+
+                            <label className="flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition group">
+                              <div className="w-8 h-8 rounded-lg bg-purple-500/20 text-purple-400 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
                                 <ImageIcon className="w-4 h-4" />
                               </div>
-                              <span className="font-medium">Photos & Videos</span>
+                              <span className="font-medium text-[13px] flex-1">Photos & Videos</span>
                               <input 
                                 type="file" 
                                 className="hidden" 
                                 accept="image/*,video/*" 
+                                multiple
                                 onChange={(e) => handleFileUpload(e, 'media')}
-                                disabled={isUploading}
                               />
                             </label>
 
-                            <label className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition">
-                              <div className="w-8 h-8 rounded-full bg-blue-500/20 text-blue-400 flex items-center justify-center">
+                            <label className="flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition group">
+                              <div className="w-8 h-8 rounded-lg bg-[#0284c7]/20 text-[#0284c7] flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
                                 <FileText className="w-4 h-4" />
                               </div>
-                              <span className="font-medium">Document / File</span>
+                              <span className="font-medium text-[13px] flex-1">All Files & Archives</span>
                               <input 
                                 type="file" 
                                 className="hidden" 
                                 accept="*/*" 
+                                multiple
                                 onChange={(e) => handleFileUpload(e, 'doc')}
-                                disabled={isUploading}
                               />
                             </label>
 
-                            <label className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition">
-                              <div className="w-8 h-8 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center">
+                            <label className="flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition group">
+                              <div className="w-8 h-8 rounded-lg bg-rose-500/20 text-rose-400 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
                                 <Camera className="w-4 h-4" />
                               </div>
-                              <span className="font-medium">Camera</span>
+                              <span className="font-medium text-[13px] flex-1">Camera</span>
                               <input 
                                 type="file" 
                                 className="hidden" 
                                 accept="image/*" 
                                 capture="environment" 
                                 onChange={(e) => handleFileUpload(e, 'camera')}
-                                disabled={isUploading}
                               />
                             </label>
 
@@ -5721,12 +6598,12 @@ export default function App() {
                                 setShowAttachMenu(false);
                                 setShowCodeModal(true);
                               }}
-                              className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition text-left"
+                              className="flex items-center gap-3 px-3 py-2 rounded-xl hover:bg-[#111b21] cursor-pointer text-[#e9edef] transition text-left group"
                             >
-                              <div className="w-8 h-8 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center">
+                              <div className="w-8 h-8 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
                                 <Code className="w-4 h-4" />
                               </div>
-                              <span className="font-medium">Code Snippet (10k+ lines)</span>
+                              <span className="font-medium text-[13px] flex-1">Code Snippet</span>
                             </button>
                           </motion.div>
                         )}
@@ -5749,11 +6626,11 @@ export default function App() {
                       <div className="flex-1 bg-[#2a3942] rounded-xl px-4 py-2 border border-transparent focus-within:border-[#00a884]/60 transition-all flex items-center">
                         <input 
                           type="text" 
-                          placeholder={isUploading ? "Uploading file..." : "Type a message"} 
+                          placeholder="Type a message" 
                           className="w-full bg-transparent border-none outline-none text-[#e9edef] text-sm placeholder:text-[#8696a0]"
                           value={newMessage}
                           onChange={(e) => setNewMessage(e.target.value)}
-                          disabled={isUploading}
+                          onPaste={handleInputPaste}
                         />
                       </div>
 
@@ -5768,7 +6645,6 @@ export default function App() {
                             whileTap={{ scale: 0.92 }}
                             type="submit" 
                             className="p-2.5 bg-[#00a884] hover:bg-[#008f6f] text-white rounded-full shadow-md shadow-[#00a884]/25 transition flex items-center justify-center shrink-0"
-                            disabled={isUploading}
                             title="Send message"
                           >
                             <Send className="w-5 h-5" />
@@ -5907,7 +6783,85 @@ export default function App() {
             onClearData={handleClearAllData}
             onDeleteAccount={handleDeleteAccount}
             onUpdateExpiry={handleUpdateExpiry}
+            onUpdateDisappearingDuration={handleUpdateGlobalDisappearingTimer}
           />
+        )}
+      </AnimatePresence>
+
+      {/* Disappearing Messages Duration Modal for Active Chat */}
+      <AnimatePresence>
+        {showDisappearingModal && activeChat && (
+          <div className="fixed inset-0 bg-black/75 flex items-center justify-center p-4 z-50 backdrop-blur-sm">
+            <motion.div 
+              initial={{ scale: 0.94, opacity: 0 }} 
+              animate={{ scale: 1, opacity: 1 }} 
+              exit={{ scale: 0.94, opacity: 0 }} 
+              className="bg-[#202c33] p-5 sm:p-6 rounded-2xl w-full max-w-sm border border-[#3b4a54] text-left shadow-2xl space-y-4 max-h-[92vh] overflow-y-auto custom-scrollbar"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-full bg-[#00a884]/20 text-[#00a884] flex items-center justify-center">
+                    <Clock className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-[#e9edef]">Disappearing Messages</h3>
+                    <p className="text-[11px] text-[#8696a0]">Self-destruct timer for this chat</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowDisappearingModal(false)}
+                  className="p-1 rounded-full text-[#8696a0] hover:text-[#e9edef] hover:bg-[#3b4a54]/50 transition"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="bg-[#111b21] p-3 rounded-xl border border-emerald-500/20 text-xs text-[#8696a0] leading-relaxed">
+                When enabled, new messages and media sent in this chat will permanently self-destruct for both participants after the chosen time. All files, photos, and chunks are purged with zero residual database traces.
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-semibold text-[#8696a0] uppercase tracking-wider block mb-1">
+                  Choose Timer
+                </label>
+                {DISAPPEARING_MESSAGE_OPTIONS.map((opt) => {
+                  const isSelected = activeChatDisappearingMs === opt.ms;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => handleUpdateChatDisappearingTimer(opt.ms)}
+                      className={cn(
+                        "w-full px-3 py-2.5 rounded-xl border flex items-center justify-between text-xs font-medium transition",
+                        isSelected 
+                          ? "bg-[#00a884]/20 border-[#00a884] text-white" 
+                          : "bg-[#111b21] hover:bg-[#2a3942] border-[#3b4a54]/60 text-[#e9edef]"
+                      )}
+                    >
+                      <div className="flex items-center gap-2">
+                        <Clock className={cn("w-3.5 h-3.5", isSelected ? "text-[#00a884]" : "text-[#8696a0]")} />
+                        <span>{opt.label}</span>
+                      </div>
+                      {isSelected && (
+                        <span className="w-2 h-2 rounded-full bg-[#00a884]"></span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowDisappearingModal(false)}
+                  className="w-full py-2.5 bg-[#2a3942] hover:bg-[#3b4a54] text-[#e9edef] text-xs font-semibold rounded-xl transition"
+                >
+                  Done
+                </button>
+              </div>
+            </motion.div>
+          </div>
         )}
       </AnimatePresence>
 
@@ -5924,9 +6878,9 @@ export default function App() {
               <div className="w-12 h-12 rounded-full bg-red-500/20 text-red-400 flex items-center justify-center mx-auto">
                 <Trash2 className="w-6 h-6" />
               </div>
-              <h3 className="text-base font-bold text-[#e9edef]">Delete Account &amp; Exit?</h3>
+              <h3 className="text-base font-bold text-[#e9edef]">Delete Account &amp; Permanent Wipe?</h3>
               <p className="text-xs text-[#8696a0] leading-relaxed">
-                Your short user ID <strong className="text-white font-mono">{user.uid}</strong> and profile will be permanently deleted from the database.
+                Your ID <strong className="text-white font-mono">{user.uid}</strong>, private conversations, messages, media chunks, and active calls will be permanently wiped from the database and your device. Zero trace will remain.
               </p>
               <div className="flex flex-col gap-2 pt-1">
                 <button
@@ -5934,7 +6888,7 @@ export default function App() {
                   onClick={handleDeleteAccount}
                   className="w-full py-2.5 px-4 bg-red-600 hover:bg-red-700 text-white text-xs font-bold rounded-xl transition shadow"
                 >
-                  Yes, Delete My Account
+                  Yes, Wipe Everything Now
                 </button>
                 <button
                   type="button"
@@ -6493,6 +7447,45 @@ export default function App() {
             isOpen={showCodeModal} 
             onClose={() => setShowCodeModal(false)} 
             onSend={(data) => handleSendCode(data)} 
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Interactive Office Spreadsheet Table Viewer (Excel, CSV, TSV) */}
+      <AnimatePresence>
+        {officeSpreadsheetData && (
+          <OfficeSpreadsheetModal
+            onClose={() => setOfficeSpreadsheetData(null)}
+            fileName={officeSpreadsheetData.fileName}
+            csvText={officeSpreadsheetData.csvText}
+            downloadUrl={officeSpreadsheetData.downloadUrl}
+            showNotification={showNotification}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Office Text Document & Notes Viewer (Word docs text, TXT, Markdown) */}
+      <AnimatePresence>
+        {officeTextData && (
+          <OfficeTextViewerModal
+            onClose={() => setOfficeTextData(null)}
+            fileName={officeTextData.fileName}
+            textContent={officeTextData.textContent}
+            downloadUrl={officeTextData.downloadUrl}
+            showNotification={showNotification}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Office Document Details & Web Viewer (PowerPoint, Word, PDF) */}
+      <AnimatePresence>
+        {officeDocDetails && (
+          <OfficeDocumentModal
+            onClose={() => setOfficeDocDetails(null)}
+            fileName={officeDocDetails.fileName}
+            fileSize={officeDocDetails.fileSize}
+            downloadUrl={officeDocDetails.downloadUrl}
+            showNotification={showNotification}
           />
         )}
       </AnimatePresence>

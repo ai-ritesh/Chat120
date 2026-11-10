@@ -21,8 +21,12 @@ service cloud.firestore {
     match /chats/{chatId}/messages/{messageId} {
       allow read: if true;
       allow create: if request.resource.data.chatId == chatId;
-      allow update: if true;
-      allow delete: if true;
+      allow update, delete: if true;
+
+      // Media chunks for large files and videos
+      match /chunks/{chunkId} {
+        allow read, write, delete: if true;
+      }
     }
 
     // Calls: WebRTC signaling for peer-to-peer encrypted voice calls
